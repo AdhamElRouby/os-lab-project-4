@@ -105,10 +105,10 @@ long long parallel_compute(char* filename, int n_proc, long long (*f)(long long,
         printf("File is empty\n");
         exit(1);
     }
-    int fd[n_proc][2];
-    long long starts[n_proc];
-    long long counts[n_proc];
-    off_t offsets[n_proc];
+    int fd[n_proc][2];        // pipe per child: [0] parent reads result, [1] child writes it
+    long long starts[n_proc]; // index of child i's first number (line) in the file
+    long long counts[n_proc]; // how many numbers (lines) child i processes
+    off_t offsets[n_proc];    // byte offset in the file where child i starts reading
     long long div = n / n_proc;
     long long rem = n % n_proc;
     long long start = 0;
