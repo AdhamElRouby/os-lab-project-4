@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sys/types.h>
 
 #define N 1000000
 #define N_PROC 6
@@ -16,7 +17,7 @@ int write_numbers_to_file() {
     }
 
     for (long long number = 1; number <= N; number++) {
-        fprintf(file, "%lld\n", number);
+        fprintf(file, "%d\n", 1);
     }
 
     fclose(file);
@@ -27,26 +28,70 @@ long long add(long long a, long long b) {
     return a + b;
 }
 
-int read_numbers_from_file(char* filename, long long* arr) {
+
+// PARALLEL_COMPTUE STARTS HERE
+
+#define BUF_SIZE (1 << 16)
+// Pass 1: count the numbers (one per line) without parsing them.
+long long count_lines(char* filename) {
     FILE *file = fopen(filename, "r");
     if (file == NULL) {
         perror("fopen");
-        return -1;
+        exit(1);
     }
-
-    for (int i = 0; i < N; i++) {
-        fscanf(file, "%lld", &arr[i]);
+    char buf[BUF_SIZE];
+    size_t got;
+    long long lines = 0;
+    while ((got = fread(buf, 1, BUF_SIZE, file)) > 0) {
+        for (size_t j = 0; j < got; j++) {
+            if (buf[j] == '\n') lines++;
+        }
     }
-
     fclose(file);
-    return 0;
+    return lines;
 }
 
-long long compute(long long* arr, int start, int end, long long (*f)(long long,long long)) {
-    long long result = arr[start];
-    for (int i = start + 1; i < end; i++) {
-        result = f(result, arr[i]);
+// Pass 2: offsets[i] = byte where line starts[i] begins.
+void find_offsets(char* filename, long long* starts, off_t* offsets, int n_proc) {
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        perror("fopen");
+        exit(1);
     }
+    char buf[BUF_SIZE];
+    size_t got;
+    long long line = 0;
+    off_t pos = 0;
+    int next = 1;
+    offsets[0] = 0;
+    while (next < n_proc && (got = fread(buf, 1, BUF_SIZE, file)) > 0) {
+        for (size_t j = 0; j < got && next < n_proc; j++) {
+            if (buf[j] == '\n') {
+                line++;
+                // `while`: children with 0 numbers share the same start line
+                while (next < n_proc && line == starts[next]) offsets[next++] = pos + j + 1;
+            }
+        }
+        pos += got;
+    }
+    fclose(file);
+}
+
+// Folds `count` numbers starting at byte `offset` of the file.
+long long compute(char* filename, off_t offset, long long count, long long (*f)(long long,long long)) {
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        perror("fopen");
+        exit(1);
+    }
+    fseeko(file, offset, SEEK_SET);
+    long long result, x;
+    fscanf(file, "%lld", &result);
+    for (long long i = 1; i < count; i++) {
+        fscanf(file, "%lld", &x);
+        result = f(result, x);
+    }
+    fclose(file);
     return result;
 }
 
@@ -55,25 +100,32 @@ long long parallel_compute(char* filename, int n_proc, long long (*f)(long long,
         printf("Number of processes must be greater than 0\n");
         exit(1);
     }
-    if(n_proc > N) n_proc = N; // Limit the number of processes to N
-    int fd[n_proc][2];
-    long long arr[N];
-    int div = N / n_proc;
-    int rem = N % n_proc;
-    int start = 0;
-    int end = div;
-
-    if(read_numbers_from_file(filename, arr) != 0) {
-        printf("Error reading numbers from file\n");
+    long long n = count_lines(filename);
+    if(n == 0) {
+        printf("File is empty\n");
         exit(1);
     }
+    int fd[n_proc][2];
+    long long starts[n_proc];
+    long long counts[n_proc];
+    off_t offsets[n_proc];
+    long long div = n / n_proc;
+    long long rem = n % n_proc;
+    long long start = 0;
 
+    for(int i = 0; i < n_proc; i++) {
+        counts[i] = div + (i < rem);
+        starts[i] = start;
+        start += counts[i];
+    }
+    find_offsets(filename, starts, offsets, n_proc);
+
+    fflush(stdout); // so children don't re-print the parent's buffered output
     for(int i = 0; i < n_proc; i++) {
         if(pipe(fd[i]) == -1) {
             perror("pipe");
             exit(1);
         }
-        if(i < rem) end++;
         pid_t pid = fork();
         if(pid == -1) {
             perror("fork");
@@ -82,23 +134,27 @@ long long parallel_compute(char* filename, int n_proc, long long (*f)(long long,
         if(pid == 0) {
             // Child process
             close(fd[i][0]); // close read end in child
-            long long result = compute(arr, start, end, f);
-            if(write(fd[i][1], &result, sizeof(result)) != sizeof(result)) {
-                perror("write");
-                exit(1);
+            if(counts[i] > 0) { // a child with no numbers sends nothing
+                long long result = compute(filename, offsets[i], counts[i], f);
+                if(write(fd[i][1], &result, sizeof(result)) != sizeof(result)) {
+                    perror("write");
+                    exit(1);
+                }
             }
             close(fd[i][1]); // close write end in child
             exit(0);
         } else {
             // Parent process
             close(fd[i][1]); // close write end in parent
-            start = end;
-            end += div;
         }
     }
 
     long long final_result = 0;
     for(int i = 0; i < n_proc; i++) {
+        if(counts[i] == 0) { // empty child: nothing to read
+            close(fd[i][0]);
+            continue;
+        }
         long long result;
         if(read(fd[i][0], &result, sizeof(result)) != sizeof(result)) {
             perror("read");
@@ -116,8 +172,11 @@ long long parallel_compute(char* filename, int n_proc, long long (*f)(long long,
     return final_result;
 }
 
+// PARALLEL_COMPTUE ENDS HERE
+
+
 int main() {
-    
+
     if(write_numbers_to_file() != 0) {
         printf("Error writing numbers to file\n");
         exit(1);
